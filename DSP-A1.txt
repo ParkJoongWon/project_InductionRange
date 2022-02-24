@@ -1,0 +1,179 @@
+#include "DSP28x_Project.h"
+
+void Init_ADC();  // ADC 설정
+void Init_Gpio();  // Gpio 설정
+interrupt void cpu_timer0_isr();
+
+int mode=0, i=0, sw=0;  // mode: 0은 초기모드, 1과 2로 모드 변경, 3은 안전모드, sw: 아두이노와 통신을 위한 변수
+float Io_ADC=0, dcoffset=2700, range=0.1, Io=0, protection=17;  // dcoffset: 2048 이지만 실측 후 3400
+// range: mode 변경의 정확도, Io: 전류센서에서 받는 값, Io_ADC: 받은 Io 계산값, protection: 안전모드
+int start=0, start_c=0;  // 초기기동에 필요한 변수
+// start: mode 변경에 필요한 변수, start_c: 초기기동 되는 횟수제어위한 변수
+
+void Init_Gpio()
+{
+    GpioCtrlRegs.GPBMUX2.bit.GPIO51=0;  // SW1: GPIO51, SW2: GPIO52
+    GpioCtrlRegs.GPBMUX2.bit.GPIO52=0;  // SW3: GPIO17, SW4: GPIO15
+    GpioCtrlRegs.GPAMUX1.bit.GPIO15=0;  //
+    GpioCtrlRegs.GPAMUX2.bit.GPIO17=0;  //
+    GpioCtrlRegs.GPAMUX1.bit.GPIO12=0;  // GK (gate keeper)
+    GpioCtrlRegs.GPAMUX1.bit.GPIO14=0;  // VTH-과온도센서 입력값
+    GpioCtrlRegs.GPBMUX1.bit.GPIO32=0;  // DCB Sense-과전류센서
+    GpioCtrlRegs.GPBMUX1.bit.GPIO35=0;  // Arduino D5 연결
+    GpioCtrlRegs.GPAMUX1.bit.GPIO4=0;  // while(1) 루프 작동시간 확인용
+
+    GpioCtrlRegs.GPBDIR.bit.GPIO51=1;  // 입출력 선택 : Output
+    GpioCtrlRegs.GPBDIR.bit.GPIO52=1;  //
+    GpioCtrlRegs.GPADIR.bit.GPIO15=1;  //
+    GpioCtrlRegs.GPADIR.bit.GPIO17=1;  //
+    GpioCtrlRegs.GPADIR.bit.GPIO12=0;  //
+    GpioCtrlRegs.GPADIR.bit.GPIO14=0;  //
+    GpioCtrlRegs.GPBDIR.bit.GPIO32=0;  //
+    GpioCtrlRegs.GPBDIR.bit.GPIO35=0; // 입출력 선택: Input
+    GpioCtrlRegs.GPADIR.bit.GPIO4=1;  // while(1) 루프 작동시간 확인용
+
+
+}
+
+void Init_ADC()
+{
+    //InitAdc();
+    AdcRegs.ADCTRL3.bit.ADCCLKPS=1;
+    AdcRegs.ADCTRL1.bit.CPS=1;
+    AdcRegs.ADCTRL1.bit.ACQ_PS=1;
+    AdcRegs.ADCTRL1.bit.SEQ_CASC=1;
+//    AdcRegs.ADCTRL1.bit.CONT_RUN = 1;           // 0:run & stop mode 1:continue
+    AdcRegs.ADCMAXCONV.all=1;
+    AdcRegs.ADCCHSELSEQ1.bit.CONV00=0;  // 전류
+    AdcRegs.ADCTRL2.bit.SOC_SEQ1=1;
+    for(i=0; i<10000; i++)  // SOC_SEQ1 작동 대기시간
+    {
+    }
+}
+
+void main(void)
+{
+    DINT;
+    InitSysCtrl();
+    InitPieCtrl();
+    IER=0x0000;  //
+    IFR=0x0000;  //
+    InitPieVectTable();
+    EALLOW;  // 설정시작
+    PieVectTable.TINT0=&cpu_timer0_isr;
+    InitCpuTimers();
+    ConfigCpuTimer(&CpuTimer0, 150, 1);  // 150MHz, 0.5us // 실험거치면서 값 변환하기
+    CpuTimer0Regs.TCR.all=0x4000;
+    IER |= M_INT1;
+    PieCtrlRegs.PIEIER1.bit.INTx7=1;
+    Init_Gpio();
+    Init_ADC();
+    EDIS;  // 설정종료
+    InitAdc();
+    EINT;
+    ERTM;
+    while(1)
+    {
+    // GpioDataRegs.GPASET.bit.GPIO4=1;  // while문 작동시간 체크
+        sw=GpioDataRegs.GPBDAT.bit.GPIO35;
+        if((sw==1)&&(start_c<=1000))  // 초기기동
+        {
+            start++;
+            start_c++;
+            if(((mode==0)||(mode==1))&&(start%2==1))
+            {
+                mode=1;
+            }
+            else if((mode==1)&&(start%2==0))
+            {
+                mode=2;
+            }
+        }
+
+        if((mode!=0)&&((Io_ADC<-protection)||(Io_ADC>protection)))
+        {
+            mode=3;  // Protection=17
+            sw=0;
+        }
+        else if((mode==3)&&((Io_ADC<-protection)||(Io_ADC>protection)))
+        {
+            mode=4;
+        }
+
+        if(sw==0)  // OFF
+        {
+            GpioDataRegs.GPBCLEAR.bit.GPIO51=1;  // SW1, 2, 3, 4: OFF
+            GpioDataRegs.GPBCLEAR.bit.GPIO52=1;
+            GpioDataRegs.GPACLEAR.bit.GPIO15=1;
+            GpioDataRegs.GPACLEAR.bit.GPIO17=1;
+            start_c=0;
+        }
+        if((sw==1)&&(start_c>1000))  // ON
+        {
+            if((Io_ADC>-protection)&&(Io_ADC<protection))
+            {
+                if(mode!=0)
+                {
+                    if((Io_ADC>=-range)&&(Io_ADC<range))
+                    {
+                        mode=mode;
+                    }
+                    else if((mode!=3)&&(Io_ADC>=0))
+                    {
+                        mode=1;
+                    }
+                    else if((mode!=3)&&(Io_ADC<0))
+                    {
+                        mode=2;
+                    }
+                }
+            }
+            if(mode==0)   //초기모드
+            {
+                start=0;
+                start_c=0;
+                GpioDataRegs.GPBCLEAR.bit.GPIO51=1;  // SW1, 2, 3, 4: OFF
+                GpioDataRegs.GPBCLEAR.bit.GPIO52=1;
+                GpioDataRegs.GPACLEAR.bit.GPIO15=1;
+                GpioDataRegs.GPACLEAR.bit.GPIO17=1;
+            }
+            if(mode==1)
+            {
+                GpioDataRegs.GPBSET.bit.GPIO51=1;    // SW1: ON
+                GpioDataRegs.GPASET.bit.GPIO15=1;    // SW4: ON
+                GpioDataRegs.GPBCLEAR.bit.GPIO52=1;  // SW2: OFF
+                GpioDataRegs.GPACLEAR.bit.GPIO17=1;  // SW3: OFF
+            }
+            if(mode==2)
+            {
+                GpioDataRegs.GPBCLEAR.bit.GPIO51=1;  // SW1: OFF
+                GpioDataRegs.GPACLEAR.bit.GPIO15=1;  // SW4: OFF
+                GpioDataRegs.GPBSET.bit.GPIO52=1;    // SW2: ON
+                GpioDataRegs.GPASET.bit.GPIO17=1;    // SW3: ON
+            }
+            if(mode==3)  // Protection
+            {
+                GpioDataRegs.GPBCLEAR.bit.GPIO51=1;
+                GpioDataRegs.GPBCLEAR.bit.GPIO52=1;
+                GpioDataRegs.GPACLEAR.bit.GPIO15=1;
+                GpioDataRegs.GPACLEAR.bit.GPIO17=1;
+            }
+            if(mode==4)  // All Clear
+            {
+                GpioDataRegs.GPBCLEAR.bit.GPIO51=1;
+                GpioDataRegs.GPBCLEAR.bit.GPIO52=1;
+                GpioDataRegs.GPACLEAR.bit.GPIO15=1;
+                GpioDataRegs.GPACLEAR.bit.GPIO17=1;
+            }
+            // GpioDataRegs.GPACLEAR.bit.GPIO4=1;  // while문 작동시간 체크
+        }  // (sw==1)&&(pot==1)
+    }  // while
+}  // main
+
+interrupt void cpu_timer0_isr(void)  // interrupt 구문
+{
+    Io=(AdcRegs.ADCRESULT0>>4); // 분해능 12bit
+    Io_ADC=((Io-dcoffset)*0.0146484375);  // 30/2048=0.0146484375
+    AdcRegs.ADCTRL2.bit.SOC_SEQ1=1;
+    PieCtrlRegs.PIEACK.all=PIEACK_GROUP1;  // PIEACK RESET
+}
